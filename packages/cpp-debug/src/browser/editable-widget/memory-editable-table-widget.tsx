@@ -25,7 +25,6 @@ import * as Long from 'long';
 import { hexStrToUnsignedLong } from '../../common/util';
 import { MemoryWidget } from '../memory-widget/memory-widget';
 import { MemoryOptionsWidget } from '../memory-widget/memory-options-widget';
-import * as Array64 from 'base64-arraybuffer';
 import { DebugProtocol } from 'vscode-debugprotocol';
 
 export type EditableMemoryWidget = MemoryWidget<MemoryOptionsWidget, MemoryEditableTableWidget>;
@@ -154,8 +153,7 @@ export class MemoryEditableTableWidget extends MemoryTableWidget {
         const offset = addressPlusArrayOffset.subtract(this.memory.address);
         const chunksPerByte = this.options.byteSize / 8;
         const startingChunkIndex = offset.subtract(offset.modulo(chunksPerByte));
-        const address = this.memory.address.add(startingChunkIndex.multiply(8 / this.options.byteSize));
-
+        const address = this.memory.address.add(startingChunkIndex.divide(chunksPerByte));
         for (let i = 0; i < chunksPerByte; i += 1) {
             const targetOffset = startingChunkIndex.add(i);
             const targetChunk = this.getFromMapOrArray(targetOffset, usePendingEdits, dataSource);
@@ -185,26 +183,31 @@ export class MemoryEditableTableWidget extends MemoryTableWidget {
     }
 
     protected submitMemoryEdits = async (): Promise<void> => {
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        for await (const _ of this.submitMemoryEditInOrder()) {
-            // Do nothing, but without lint errors.
-        }
-    };
-
-    private * submitMemoryEditInOrder(): IterableIterator<Promise<DebugProtocol.WriteMemoryResponse | undefined>> {
         this.memoryEditsCompleted = new Deferred();
-        const addressesSubmitted = new Set<Long>();
-        for (const k of this.pendingMemoryEdits.keys()) {
-            const address = Long.fromString(k);
-            const { address: addressToSend, value: valueToSend } = this.composeByte(address, true);
-            if (!addressesSubmitted.has(addressToSend)) {
-                const data = Array64.encode(new Uint8Array([parseInt(valueToSend, 16)]));
-                const writeMemoryArguments = { memoryReference: addressToSend.toString(), data };
-                yield this.memoryProvider.writeMemory?.(writeMemoryArguments) ?? Promise.resolve(undefined);
-                addressesSubmitted.add(addressToSend);
+        for (const edit of this.createUniqueEdits()) {
+            try {
+                await this.memoryProvider.writeMemory(edit);
+            } catch (e) {
+                console.log('Problem writing memory with arguments', edit, '\n', e);
             }
         }
         this.memoryEditsCompleted.resolve();
+    };
+
+    private createUniqueEdits(): Array<DebugProtocol.WriteMemoryArguments> {
+        const addressesSubmitted = new Set<string>();
+        const edits = [];
+        for (const k of this.pendingMemoryEdits.keys()) {
+            const address = Long.fromString(k);
+            const { address: addressToSend, value: valueToSend } = this.composeByte(address, true);
+            const memoryReference = '0x' + addressToSend.toString(16);
+            if (!addressesSubmitted.has(memoryReference)) {
+                const data = Buffer.from(valueToSend, 'hex').toString('base64');
+                edits.push({ memoryReference, data });
+                addressesSubmitted.add(memoryReference);
+            }
+        }
+        return edits;
     }
 
     protected getWrapperHandlers(): MemoryTable.WrapperHandlers {
